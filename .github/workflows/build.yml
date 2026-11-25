@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -194,6 +197,7 @@ jobs:
           import android.webkit.URLUtil
           import android.webkit.WebChromeClient
           import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
           import android.webkit.WebSettings
           import android.webkit.WebView
           import android.webkit.WebViewClient
@@ -204,6 +208,8 @@ jobs:
 
           class BrowserActivity : Activity() {
               private lateinit var webView: WebView
+              private lateinit var btnSaveVideo: Button
+              private var detectedVideoUrl: String? = null
               private var isDesktopMode = false
               private var mobileUa: String = ""
               private val desktopUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -220,18 +226,25 @@ jobs:
                   val topBar = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       setBackgroundColor(Color.parseColor("#1E293B"))
-                      setPadding(8, 8, 8, 8)
+                      setPadding(6, 8, 6, 8)
                   }
 
                   val btnBack = Button(this).apply { text = "Back" }
                   val btnDesktop = Button(this).apply { text = "Desktop" }
-                  val btnGrab = Button(this).apply { text = "Save Cookies" }
+                  val btnGrab = Button(this).apply { text = "Cookies" }
+                  btnSaveVideo = Button(this).apply {
+                      text = "DL Video"
+                      visibility = View.GONE
+                      setBackgroundColor(Color.parseColor("#16A34A"))
+                      setTextColor(Color.WHITE)
+                  }
                   val btnClose = Button(this).apply { text = "Close" }
 
                   val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                   topBar.addView(btnBack, lp)
                   topBar.addView(btnDesktop, lp)
                   topBar.addView(btnGrab, lp)
+                  topBar.addView(btnSaveVideo, lp)
                   topBar.addView(btnClose, lp)
 
                   val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -256,6 +269,25 @@ jobs:
                   cm.setAcceptCookie(true)
                   cm.setAcceptThirdPartyCookies(webView, true)
 
+                  fun enqueueDownload(url: String, userAgent: String?, contentDisposition: String?, mimetype: String?) {
+                      try {
+                          val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype ?: "video/mp4")
+                          val req = DownloadManager.Request(Uri.parse(url))
+                          req.setMimeType(mimetype ?: "video/mp4")
+                          val cookies: String? = cm.getCookie(url)
+                          if (!cookies.isNullOrEmpty()) req.addRequestHeader("Cookie", cookies)
+                          if (!userAgent.isNullOrEmpty()) req.addRequestHeader("User-Agent", userAgent)
+                          req.setTitle(fileName)
+                          req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                          req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TeraBoxDL/$fileName")
+                          val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                          dm.enqueue(req)
+                          Toast.makeText(this, "Downloading: $fileName", Toast.LENGTH_LONG).show()
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
+                      }
+                  }
+
                   webView.webChromeClient = object : WebChromeClient() {
                       override fun onProgressChanged(view: WebView?, newProgress: Int) {
                           if (newProgress < 100) {
@@ -276,28 +308,34 @@ jobs:
                           Toast.makeText(this@BrowserActivity, "App redirect blocked. Use Desktop mode.", Toast.LENGTH_SHORT).show()
                           return true
                       }
+
+                      override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                          val reqUrl = request?.url?.toString()
+                          if (reqUrl != null && (reqUrl.startsWith("http://") || reqUrl.startsWith("https://"))) {
+                              val lower = reqUrl.lowercase()
+                              if (lower.contains(".mp4") || lower.contains("mime=video%2fmp4") || lower.contains("mime=video/mp4")) {
+                                  runOnUiThread {
+                                      detectedVideoUrl = reqUrl
+                                      btnSaveVideo.visibility = View.VISIBLE
+                                  }
+                              }
+                          }
+                          return super.shouldInterceptRequest(view, request)
+                      }
                   }
 
                   webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
                       if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
-                          try {
-                              val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
-                              val req = DownloadManager.Request(Uri.parse(url))
-                              req.setMimeType(mimetype)
-                              val cookies: String? = cm.getCookie(url)
-                              if (!cookies.isNullOrEmpty()) req.addRequestHeader("Cookie", cookies)
-                              if (!userAgent.isNullOrEmpty()) req.addRequestHeader("User-Agent", userAgent)
-                              req.setTitle(fileName)
-                              req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                              req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TeraBoxDL/$fileName")
-                              val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                              dm.enqueue(req)
-                              Toast.makeText(this, "Downloading: $fileName", Toast.LENGTH_LONG).show()
-                          } catch (e: Exception) {
-                              Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
-                          }
+                          enqueueDownload(url, userAgent, contentDisposition, mimetype)
                       } else {
                           Toast.makeText(this, "Unsupported link (blob/non-http)", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  btnSaveVideo.setOnClickListener {
+                      val vUrl = detectedVideoUrl
+                      if (vUrl != null) {
+                          enqueueDownload(vUrl, webView.settings.userAgentString, null, "video/mp4")
                       }
                   }
 
@@ -409,7 +447,7 @@ jobs:
             ];
 
             int _tab = 0;
-            String _mode = 'get'; // get, exp, exphd, dw
+            String _mode = 'get';
             bool _busy = false;
             bool _cancelRequested = false;
             double? _progress;
@@ -700,7 +738,7 @@ jobs:
 
                 if (cookies.isEmpty) {
                   throw Exception(
-                    'TeraBox cookies missing! Go to Settings -> "Login & Grab Cookies" (or paste COOKIES1), then try again.',
+                    'TeraBox cookies missing! Go to Settings -> "Login & Grab Cookies", then try again.',
                   );
                 }
 
@@ -742,12 +780,12 @@ jobs:
 
                 if (workingQuality == null) {
                   throw Exception(
-                    'All qualities failed (cookies expired or rate-limited). Grab fresh cookies in Browser or try Built-in Browser mode.',
+                    'All qualities failed (cookies expired or rate-limited). Grab fresh cookies in Browser or try Built-in Browser.',
                   );
                 }
                 _log('Selected quality: $workingQuality');
 
-                _log('[4/5] Scanning HLS chunks (budget collector)...');
+                _log('[4/5] Scanning HLS chunks...');
                 final known = <int, Map<String, dynamic>>{};
                 int reqCount = 0;
                 int noNewMaxStreak = 0;
@@ -895,7 +933,7 @@ jobs:
                   final dwUrl = _dwProxyCtrl.text.trim();
                   final dwKey = _dwKeyCtrl.text.trim();
                   if (dwUrl.isEmpty || dwKey.isEmpty) {
-                    throw Exception('Set DISKWALA_PROXY_URL and DISKWALA_API_KEY in Settings first.');
+                    throw Exception('Diskwala Proxy URL/API Key missing in Settings. Use "Open in Built-in Browser" instead!');
                   }
                   _log('Requesting Diskwala proxy...');
                   final req = await client.postUrl(Uri.parse(dwUrl)).timeout(const Duration(seconds: 120));
@@ -1053,7 +1091,7 @@ jobs:
                     enabled: !_busy,
                     decoration: const InputDecoration(
                       labelText: 'TeraBox / Diskwala Link',
-                      hintText: 'https://1024terabox.com/s/1...',
+                      hintText: 'https://1024terabox.com/s/1... or diskwala.com/...',
                       border: OutlineInputBorder(),
                       prefixIcon: Icon(Icons.link),
                     ),
@@ -1086,7 +1124,7 @@ jobs:
                     ],
                   ),
                   const SizedBox(height: 14),
-                  const Text('Select Mode (from Repo):', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const Text('Select Mode:', style: TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
                   Wrap(
                     spacing: 8,
@@ -1107,7 +1145,7 @@ jobs:
                         onSelected: _busy ? null : (_) => setState(() => _mode = 'exphd'),
                       ),
                       ChoiceChip(
-                        label: const Text('/dw (Diskwala)'),
+                        label: const Text('/dw (Diskwala Proxy)'),
                         selected: _mode == 'dw',
                         onSelected: _busy ? null : (_) => setState(() => _mode = 'dw'),
                       ),
@@ -1131,7 +1169,7 @@ jobs:
                     onPressed: () => _openBrowser(_urlCtrl.text),
                     icon: const Icon(Icons.open_in_browser),
                     label: Text(hasCookies
-                        ? 'Open in Built-in Browser (Cookies Ready)'
+                        ? 'Open in Built-in Browser (Diskwala / Login)'
                         : 'Open Browser (Login & Grab Cookies)'),
                   ),
                   const SizedBox(height: 16),
@@ -1231,13 +1269,17 @@ jobs:
                     child: Padding(
                       padding: EdgeInsets.all(16),
                       child: Text(
-                        'Beginner Guide (App Kaise Use Karein):\n\n'
-                        '1. Sabse pehle Settings tab me jayein aur "Login TeraBox & Auto-Grab Cookies" par tap karein.\n'
-                        '2. TeraBox account se login karein (Free account bhi chalega), phir upar "Save Cookies" button dabakar "Close" karein.\n'
-                        '3. Ab Download tab me koi bhi TeraBox link paste karein, "/get (Direct)" select karein aur "Download Video" dabayein.\n'
-                        '4. File aapke phone ke "Downloads/TeraBoxDL" folder me save hogi.\n'
-                        '5. Note: /get mode se download hui .ts video ko dekhne ke liye VLC ya MX Player use karein.\n'
-                        '6. Agar kabhi /get fail ho, to "Open in Built-in Browser" dabakar "Desktop" mode ON karein aur page se direct download karein.',
+                        'Beginner Guide:\n\n'
+                        '1. TeraBox (/get Direct):\n'
+                        '   - Settings tab -> "Login TeraBox & Auto-Grab Cookies" dabakar login karein.\n'
+                        '   - Upar "Cookies" button dabayein, phir "Close" karein.\n'
+                        '   - Link paste karke "/get (Direct)" se download karein.\n\n'
+                        '2. Diskwala (Bina Proxy ke):\n'
+                        '   - Diskwala link paste karein -> "Open in Built-in Browser" dabayein.\n'
+                        '   - Video play karein -> jaise hi .mp4 milega, upar green "DL Video" button dikhega!\n'
+                        '   - Ya agar proxy URL/Key hai to Settings me daal kar "/dw" use karein.\n\n'
+                        '3. Files kahan save hongi:\n'
+                        '   - Phone ke "Downloads/TeraBoxDL" folder me (.ts file VLC/MX Player me play karein).',
                         style: TextStyle(height: 1.5),
                       ),
                     ),
@@ -1250,7 +1292,7 @@ jobs:
             Widget build(BuildContext context) {
               return Scaffold(
                 appBar: AppBar(
-                  title: const Text('TeraBox Video Downloader'),
+                  title: const Text('TeraBox & Diskwala DL'),
                   centerTitle: true,
                 ),
                 body: IndexedStack(
@@ -1279,8 +1321,15 @@ jobs:
         working-directory: terabox_dl
         run: flutter build apk --release
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
           path: terabox_dl/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }}
+          files: terabox_dl/build/app/outputs/flutter-apk/app-release.apk
