@@ -1,0 +1,1286 @@
+name: Build TeraBox Downloader APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Generate Android App from Repo Logic
+        run: |
+          flutter create --platforms=android --org com.example terabox_dl
+          cd terabox_dl
+
+          python3 - << 'PYEOF'
+          manifest_path = "android/app/src/main/AndroidManifest.xml"
+          with open(manifest_path, "r") as f:
+              text = f.read()
+
+          perms = """    <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+          """
+          if "android.permission.INTERNET" not in text:
+              text = text.replace("<application", perms + "<application", 1)
+
+          activity_decl = """        <activity
+                      android:name=".BrowserActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
+          """
+          if "BrowserActivity" not in text:
+              text = text.replace("</application>", activity_decl + "    </application>", 1)
+
+          with open(manifest_path, "w") as f:
+              f.write(text)
+          PYEOF
+
+          cat << 'EOF' > android/app/src/main/kotlin/com/example/terabox_dl/MainActivity.kt
+          package com.example.terabox_dl
+
+          import android.app.DownloadManager
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.webkit.URLUtil
+          import android.widget.Toast
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+
+          class MainActivity : FlutterActivity() {
+              private val channelName = "com.example.terabox_dl/dl"
+              private val prefsName = "terabox_dl_prefs"
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "openBrowser" -> {
+                              val url = call.argument<String>("url") ?: "https://www.1024tera.com"
+                              val intent = Intent(this, BrowserActivity::class.java)
+                              intent.putExtra("url", url)
+                              startActivity(intent)
+                              result.success(true)
+                          }
+                          "loadPrefs" -> {
+                              val prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+                              val out = HashMap<String, String>()
+                              for ((k, v) in prefs.all) {
+                                  if (v != null) out[k] = v.toString()
+                              }
+                              result.success(out)
+                          }
+                          "savePrefs" -> {
+                              val map = call.arguments as? Map<*, *>
+                              val editor = getSharedPreferences(prefsName, Context.MODE_PRIVATE).edit()
+                              map?.forEach { (k, v) ->
+                                  if (k != null) editor.putString(k.toString(), v?.toString() ?: "")
+                              }
+                              editor.apply()
+                              result.success(true)
+                          }
+                          "saveToDownloads" -> {
+                              val srcPath = call.argument<String>("srcPath") ?: ""
+                              val fileName = call.argument<String>("fileName") ?: "video.mp4"
+                              val mimeType = call.argument<String>("mimeType") ?: "video/mp4"
+                              try {
+                                  val savedLoc = copyToPublicDownloads(srcPath, fileName, mimeType)
+                                  result.success(savedLoc)
+                              } catch (e: Exception) {
+                                  result.error("SAVE_ERR", e.message, null)
+                              }
+                          }
+                          "directDownload" -> {
+                              val url = call.argument<String>("url") ?: ""
+                              if (url.startsWith("http://") || url.startsWith("https://")) {
+                                  try {
+                                      val fileName = URLUtil.guessFileName(url, null, null)
+                                      val req = DownloadManager.Request(Uri.parse(url))
+                                      req.setTitle(fileName)
+                                      req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                      req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TeraBoxDL/$fileName")
+                                      val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                      dm.enqueue(req)
+                                      Toast.makeText(this, "Download started: $fileName", Toast.LENGTH_SHORT).show()
+                                      result.success(true)
+                                  } catch (e: Exception) {
+                                      result.error("DL_ERR", e.message, null)
+                                  }
+                              } else {
+                                  result.error("INVALID_URL", "URL must start with http:// or https://", null)
+                              }
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              private fun copyToPublicDownloads(srcPath: String, fileName: String, mimeType: String): String {
+                  val srcFile = File(srcPath)
+                  if (!srcFile.exists()) throw Exception("Source file not found")
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                          put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/TeraBoxDL")
+                          put(MediaStore.Downloads.IS_PENDING, 1)
+                      }
+                      val resolver = contentResolver
+                      val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                          ?: throw Exception("Cannot create Downloads entry")
+                      resolver.openOutputStream(uri)?.use { out ->
+                          FileInputStream(srcFile).use { input ->
+                              input.copyTo(out)
+                          }
+                      } ?: throw Exception("Cannot write to Downloads")
+                      values.clear()
+                      values.put(MediaStore.Downloads.IS_PENDING, 0)
+                      resolver.update(uri, values, null, null)
+                      return "Downloads/TeraBoxDL/$fileName"
+                  } else {
+                      @Suppress("DEPRECATION")
+                      val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "TeraBoxDL")
+                      if (!dir.exists()) dir.mkdirs()
+                      val dest = File(dir, fileName)
+                      FileInputStream(srcFile).use { input ->
+                          FileOutputStream(dest).use { out ->
+                              input.copyTo(out)
+                          }
+                      }
+                      return dest.absolutePath
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > android/app/src/main/kotlin/com/example/terabox_dl/BrowserActivity.kt
+          package com.example.terabox_dl
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.app.DownloadManager
+          import android.content.Context
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.view.View
+          import android.webkit.CookieManager
+          import android.webkit.URLUtil
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.Toast
+
+          class BrowserActivity : Activity() {
+              private lateinit var webView: WebView
+              private var isDesktopMode = false
+              private var mobileUa: String = ""
+              private val desktopUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.WHITE)
+                  }
+
+                  val topBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(Color.parseColor("#1E293B"))
+                      setPadding(8, 8, 8, 8)
+                  }
+
+                  val btnBack = Button(this).apply { text = "Back" }
+                  val btnDesktop = Button(this).apply { text = "Desktop" }
+                  val btnGrab = Button(this).apply { text = "Save Cookies" }
+                  val btnClose = Button(this).apply { text = "Close" }
+
+                  val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  topBar.addView(btnBack, lp)
+                  topBar.addView(btnDesktop, lp)
+                  topBar.addView(btnGrab, lp)
+                  topBar.addView(btnClose, lp)
+
+                  val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100
+                      visibility = View.GONE
+                  }
+
+                  webView = WebView(this)
+                  mobileUa = webView.settings.userAgentString
+
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      useWideViewPort = true
+                      loadWithOverviewMode = true
+                      builtInZoomControls = true
+                      displayZoomControls = false
+                      mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                  }
+
+                  val cm = CookieManager.getInstance()
+                  cm.setAcceptCookie(true)
+                  cm.setAcceptThirdPartyCookies(webView, true)
+
+                  webView.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                          if (newProgress < 100) {
+                              progressBar.visibility = View.VISIBLE
+                              progressBar.progress = newProgress
+                          } else {
+                              progressBar.visibility = View.GONE
+                          }
+                      }
+                  }
+
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                          val url = request?.url?.toString() ?: return false
+                          if (url.startsWith("http://") || url.startsWith("https://")) {
+                              return false
+                          }
+                          Toast.makeText(this@BrowserActivity, "App redirect blocked. Use Desktop mode.", Toast.LENGTH_SHORT).show()
+                          return true
+                      }
+                  }
+
+                  webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+                      if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                          try {
+                              val fileName = URLUtil.guessFileName(url, contentDisposition, mimetype)
+                              val req = DownloadManager.Request(Uri.parse(url))
+                              req.setMimeType(mimetype)
+                              val cookies: String? = cm.getCookie(url)
+                              if (!cookies.isNullOrEmpty()) req.addRequestHeader("Cookie", cookies)
+                              if (!userAgent.isNullOrEmpty()) req.addRequestHeader("User-Agent", userAgent)
+                              req.setTitle(fileName)
+                              req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                              req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TeraBoxDL/$fileName")
+                              val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                              dm.enqueue(req)
+                              Toast.makeText(this, "Downloading: $fileName", Toast.LENGTH_LONG).show()
+                          } catch (e: Exception) {
+                              Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
+                          }
+                      } else {
+                          Toast.makeText(this, "Unsupported link (blob/non-http)", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  btnBack.setOnClickListener {
+                      if (webView.canGoBack()) webView.goBack() else finish()
+                  }
+                  btnClose.setOnClickListener { finish() }
+                  btnDesktop.setOnClickListener {
+                      isDesktopMode = !isDesktopMode
+                      webView.settings.userAgentString = if (isDesktopMode) desktopUa else mobileUa
+                      btnDesktop.text = if (isDesktopMode) "Mobile" else "Desktop"
+                      webView.reload()
+                  }
+                  btnGrab.setOnClickListener {
+                      cm.flush()
+                      val urls = listOfNotNull(
+                          webView.url,
+                          "https://dm.1024tera.com",
+                          "https://www.1024tera.com",
+                          "https://www.1024terabox.com",
+                          "https://www.terabox.com"
+                      )
+                      val merged = LinkedHashMap<String, String>()
+                      for (u in urls) {
+                          val raw = cm.getCookie(u) ?: continue
+                          for (part in raw.split(";")) {
+                              val idx = part.indexOf("=")
+                              if (idx > 0) {
+                                  val k = part.substring(0, idx).trim()
+                                  val v = part.substring(idx + 1).trim()
+                                  if (k.isNotEmpty()) merged[k] = v
+                              }
+                          }
+                      }
+                      if (merged.isEmpty()) {
+                          Toast.makeText(this, "No cookies found yet. Login first!", Toast.LENGTH_SHORT).show()
+                      } else {
+                          val cookieStr = merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                          getSharedPreferences("terabox_dl_prefs", Context.MODE_PRIVATE)
+                              .edit().putString("cookies", cookieStr).apply()
+                          Toast.makeText(this, "Saved ${merged.size} cookies! Tap Close now.", Toast.LENGTH_LONG).show()
+                      }
+                  }
+
+                  root.addView(topBar)
+                  root.addView(progressBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 10))
+                  root.addView(webView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+
+                  val targetUrl = intent.getStringExtra("url") ?: "https://www.1024tera.com"
+                  webView.loadUrl(targetUrl)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'dart:math';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          void main() {
+            runApp(const TeraBoxApkApp());
+          }
+
+          class TeraBoxApkApp extends StatelessWidget {
+            const TeraBoxApkApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'TeraBox & Diskwala DL',
+                theme: ThemeData(
+                  colorSchemeSeed: Colors.indigo,
+                  useMaterial3: true,
+                ),
+                home: const MainShell(),
+              );
+            }
+          }
+
+          class MainShell extends StatefulWidget {
+            const MainShell({super.key});
+
+            @override
+            State<MainShell> createState() => _MainShellState();
+          }
+
+          class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
+            static const _ch = MethodChannel('com.example.terabox_dl/dl');
+            static const _baseUrl = 'https://dm.1024tera.com';
+            static const _userAgents = [
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+            ];
+
+            int _tab = 0;
+            String _mode = 'get'; // get, exp, exphd, dw
+            bool _busy = false;
+            bool _cancelRequested = false;
+            double? _progress;
+            String _statusText = 'Ready. Paste a TeraBox or Diskwala link.';
+            final List<String> _logs = [];
+
+            final _urlCtrl = TextEditingController();
+            final _cookiesCtrl = TextEditingController();
+            final _proxyUrlCtrl = TextEditingController();
+            final _thirdPartyCtrl = TextEditingController(text: 'https://www.teraboxdl.site/');
+            final _dwProxyCtrl = TextEditingController();
+            final _dwKeyCtrl = TextEditingController();
+
+            final _rng = Random();
+
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addObserver(this);
+              _loadPrefs();
+            }
+
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              _urlCtrl.dispose();
+              _cookiesCtrl.dispose();
+              _proxyUrlCtrl.dispose();
+              _thirdPartyCtrl.dispose();
+              _dwProxyCtrl.dispose();
+              _dwKeyCtrl.dispose();
+              super.dispose();
+            }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state == AppLifecycleState.resumed) {
+                _loadPrefs();
+              }
+            }
+
+            Future<void> _loadPrefs() async {
+              try {
+                final res = await _ch.invokeMapMethod<String, String>('loadPrefs');
+                if (res != null && mounted) {
+                  setState(() {
+                    _cookiesCtrl.text = res['cookies'] ?? '';
+                    _proxyUrlCtrl.text = res['proxy_url'] ?? '';
+                    final tp = res['third_party_url'] ?? '';
+                    if (tp.isNotEmpty) _thirdPartyCtrl.text = tp;
+                    _dwProxyCtrl.text = res['dw_proxy_url'] ?? '';
+                    _dwKeyCtrl.text = res['dw_api_key'] ?? '';
+                  });
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _savePrefs() async {
+              await _ch.invokeMethod('savePrefs', {
+                'cookies': _cookiesCtrl.text.trim(),
+                'proxy_url': _proxyUrlCtrl.text.trim(),
+                'third_party_url': _thirdPartyCtrl.text.trim(),
+                'dw_proxy_url': _dwProxyCtrl.text.trim(),
+                'dw_api_key': _dwKeyCtrl.text.trim(),
+              });
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Settings saved!')),
+                );
+              }
+            }
+
+            void _log(String msg) {
+              if (!mounted) return;
+              setState(() {
+                _statusText = msg;
+                _logs.add(msg);
+                if (_logs.length > 40) _logs.removeAt(0);
+              });
+            }
+
+            String _randUa() => _userAgents[_rng.nextInt(_userAgents.length)];
+
+            String _logId() {
+              final hi = 400000000 + _rng.nextInt(599999999);
+              final lo = 100000000 + _rng.nextInt(899999999);
+              return '$hi$lo';
+            }
+
+            String _safeFilename(String name) =>
+                name.replaceAll(RegExp(r'[\\/*?:"<>|]'), '_');
+
+            String _fmtBytes(int bytes) {
+              if (bytes < 1024) return '$bytes B';
+              if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+              if (bytes < 1024 * 1024 * 1024) {
+                return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+              }
+              return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+            }
+
+            String? _extractSurl(String text) {
+              final re = RegExp(
+                r'https?://(?:[\w.-]+\.)?[\w.-]+\.[a-z]{2,}'
+                r'(?:/(?:[A-Za-z0-9_.%-]+/)?1?([A-Za-z0-9_-]{6,})'
+                r'|/(?:sharing/link|wap/share/filelist|share/link)\?[^#\s]*?surl=1?([A-Za-z0-9_-]+))',
+                caseSensitive: false,
+              );
+              final m = re.firstMatch(text);
+              if (m != null) return m.group(1) ?? m.group(2);
+              return null;
+            }
+
+            Future<String> _httpGetText(
+              HttpClient client,
+              String url, {
+              Map<String, String>? headers,
+              int timeoutSec = 45,
+            }) async {
+              final req = await client.getUrl(Uri.parse(url)).timeout(Duration(seconds: timeoutSec));
+              headers?.forEach((k, v) => req.headers.set(k, v));
+              final resp = await req.close().timeout(Duration(seconds: timeoutSec));
+              return await resp.transform(utf8.decoder).join();
+            }
+
+            Future<String> _getJsToken(HttpClient client, String surl) async {
+              final url = '$_baseUrl/wap/share/filelist?surl=$surl&clearCache=1';
+              for (int attempt = 0; attempt < 3; attempt++) {
+                if (_cancelRequested) throw Exception('Cancelled');
+                try {
+                  final html = await _httpGetText(client, url, headers: {
+                    'User-Agent': _randUa(),
+                    'Referer': '$_baseUrl/wap/share/filelist?surl=$surl',
+                  });
+                  final m1 = RegExp(r'fn%28%22([A-Fa-f0-9]+)%22%29').firstMatch(html);
+                  if (m1 != null) return m1.group(1)!;
+                  final m2 = RegExp(r'eval\(decodeURIComponent\(`([^`]+)`\)\)').firstMatch(html);
+                  if (m2 != null) {
+                    final dec = Uri.decodeComponent(m2.group(1)!);
+                    final m3 = RegExp(r'fn\("([A-Fa-f0-9]+)"\)').firstMatch(dec);
+                    if (m3 != null) return m3.group(1)!;
+                  }
+                  final m4 = RegExp(r'"jsToken"\s*:\s*"([A-Fa-f0-9]+)"').firstMatch(html);
+                  if (m4 != null) return m4.group(1)!;
+                } catch (_) {}
+                await Future.delayed(const Duration(seconds: 2));
+              }
+              throw Exception('Could not extract jsToken from TeraBox page.');
+            }
+
+            Future<Map<String, dynamic>> _getShareInfo(
+              HttpClient client,
+              String jsToken,
+              String surl,
+            ) async {
+              final uri = Uri.parse('$_baseUrl/api/shorturlinfo').replace(queryParameters: {
+                'app_id': '250528',
+                'shorturl': '1$surl',
+                'root': '1',
+                'web': '1',
+                'channel': 'dubox',
+                'clienttype': '0',
+                'jsToken': jsToken,
+                't': '${DateTime.now().millisecondsSinceEpoch ~/ 1000}',
+                'dp-logid': _logId(),
+              });
+              final body = await _httpGetText(client, uri.toString(), headers: {
+                'User-Agent': _randUa(),
+                'Referer': '$_baseUrl/wap/share/filelist?surl=$surl',
+                'Accept': 'application/json, text/plain, */*',
+                'Origin': _baseUrl,
+              });
+              final data = jsonDecode(body) as Map<String, dynamic>;
+              if (data['errno'] != 0) {
+                throw Exception('shorturlinfo error: errno=${data['errno']}');
+              }
+              return data;
+            }
+
+            String _buildStreamingUrl({
+              required dynamic shareid,
+              required dynamic uk,
+              required String sign,
+              required dynamic timestamp,
+              required dynamic fsId,
+              required String quality,
+            }) {
+              return Uri.parse('$_baseUrl/share/streaming').replace(queryParameters: {
+                'uk': '$uk',
+                'shareid': '$shareid',
+                'type': quality,
+                'fid': '$fsId',
+                'sign': sign,
+                'timestamp': '$timestamp',
+                'jsToken': '',
+                'esl': '1',
+                'isplayer': '1',
+                'ehps': '1',
+                'clienttype': '0',
+                'app_id': '250528',
+                'web': '1',
+                'channel': 'dubox',
+                'dp-logid': _logId(),
+              }).toString();
+            }
+
+            Future<void> _downloadDirectStreamToFile(
+              HttpClient client,
+              String url,
+              File outFile, {
+              Map<String, String>? headers,
+            }) async {
+              final req = await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 60));
+              headers?.forEach((k, v) => req.headers.set(k, v));
+              final resp = await req.close().timeout(const Duration(seconds: 60));
+              if (resp.statusCode >= 400) {
+                throw Exception('HTTP ${resp.statusCode}');
+              }
+              final total = resp.contentLength;
+              int done = 0;
+              final sink = outFile.openWrite();
+              try {
+                await for (final chunk in resp) {
+                  if (_cancelRequested) throw Exception('Cancelled');
+                  sink.add(chunk);
+                  done += chunk.length;
+                  if (mounted) {
+                    setState(() {
+                      _progress = total > 0 ? (done / total).clamp(0.0, 1.0) : null;
+                      _statusText = total > 0
+                          ? 'Downloading: ${_fmtBytes(done)} / ${_fmtBytes(total)}'
+                          : 'Downloading: ${_fmtBytes(done)}';
+                    });
+                  }
+                }
+              } finally {
+                await sink.close();
+              }
+            }
+
+            Future<void> _runTraditionalEngine(String rawUrl) async {
+              final cookies = _cookiesCtrl.text.trim();
+              final surl = _extractSurl(rawUrl);
+              if (surl == null || surl.isEmpty) {
+                throw Exception('Invalid TeraBox URL (could not find SURL).');
+              }
+
+              final client = HttpClient();
+              final tmpDir = Directory.systemTemp.createTempSync('tb_');
+              try {
+                _log('[1/5] Extracting jsToken for $surl...');
+                final jsToken = await _getJsToken(client, surl);
+
+                _log('[2/5] Fetching share metadata...');
+                final info = await _getShareInfo(client, jsToken, surl);
+                final list = (info['list'] as List?) ?? [];
+                if (list.isEmpty) throw Exception('No files found in this link.');
+
+                final f0 = list[0] as Map<String, dynamic>;
+                final filename = _safeFilename((f0['server_filename'] ?? 'terabox_video.mp4').toString());
+                final sizeBytes = int.tryParse('${f0['size'] ?? 0}') ?? 0;
+                final fsId = f0['fs_id'];
+                final shareid = info['shareid'];
+                final uk = info['uk'];
+                final sign = info['sign'].toString();
+                final timestamp = info['timestamp'];
+                final dlink = (f0['dlink'] ?? '').toString();
+
+                _log('Found: $filename (${_fmtBytes(sizeBytes)})');
+
+                if (dlink.isNotEmpty && dlink.startsWith('http')) {
+                  _log('Direct dlink found! Downloading MP4...');
+                  final outName = filename.toLowerCase().endsWith('.mp4') ? filename : '$filename.mp4';
+                  final tempFile = File('${tmpDir.path}/$outName');
+                  await _downloadDirectStreamToFile(client, dlink, tempFile, headers: {
+                    'User-Agent': _randUa(),
+                    'Referer': '$_baseUrl/wap/share/filelist?surl=$surl',
+                    if (cookies.isNotEmpty) 'Cookie': cookies,
+                  });
+                  final saved = await _ch.invokeMethod<String>('saveToDownloads', {
+                    'srcPath': tempFile.path,
+                    'fileName': outName,
+                    'mimeType': 'video/mp4',
+                  });
+                  _log('Saved to $saved');
+                  return;
+                }
+
+                if (cookies.isEmpty) {
+                  throw Exception(
+                    'TeraBox cookies missing! Go to Settings -> "Login & Grab Cookies" (or paste COOKIES1), then try again.',
+                  );
+                }
+
+                final headers = {
+                  'User-Agent': _randUa(),
+                  'Referer': '$_baseUrl/wap/share/filelist?surl=$surl',
+                  'Cookie': cookies,
+                };
+
+                _log('[3/5] Checking available video quality...');
+                const qualities = [
+                  'M3U8_AUTO_1080',
+                  'M3U8_AUTO_720',
+                  'M3U8_AUTO_480',
+                  'M3U8_AUTO_360',
+                  'M3U8_720P',
+                  'M3U8_480P',
+                  'M3U8_360P',
+                ];
+                String? workingQuality;
+                for (final q in qualities) {
+                  if (_cancelRequested) throw Exception('Cancelled');
+                  final u = _buildStreamingUrl(
+                    shareid: shareid,
+                    uk: uk,
+                    sign: sign,
+                    timestamp: timestamp,
+                    fsId: fsId,
+                    quality: q,
+                  );
+                  try {
+                    final txt = (await _httpGetText(client, u, headers: headers, timeoutSec: 25)).trim();
+                    if (txt.startsWith('#EXTM3U')) {
+                      workingQuality = q;
+                      break;
+                    }
+                  } catch (_) {}
+                }
+
+                if (workingQuality == null) {
+                  throw Exception(
+                    'All qualities failed (cookies expired or rate-limited). Grab fresh cookies in Browser or try Built-in Browser mode.',
+                  );
+                }
+                _log('Selected quality: $workingQuality');
+
+                _log('[4/5] Scanning HLS chunks (budget collector)...');
+                final known = <int, Map<String, dynamic>>{};
+                int reqCount = 0;
+                int noNewMaxStreak = 0;
+                int maxKnownIdx = -1;
+
+                bool isComplete() {
+                  if (known.isEmpty) return false;
+                  final keys = known.keys.toList()..sort();
+                  if (keys.first > 1) return false;
+                  return keys.length == (keys.last - keys.first + 1);
+                }
+
+                while (true) {
+                  if (_cancelRequested) throw Exception('Cancelled');
+                  reqCount++;
+                  final streamUrl = _buildStreamingUrl(
+                    shareid: shareid,
+                    uk: uk,
+                    sign: sign,
+                    timestamp: timestamp,
+                    fsId: fsId,
+                    quality: workingQuality,
+                  );
+                  try {
+                    final text = (await _httpGetText(client, streamUrl, headers: headers, timeoutSec: 35)).trim();
+                    if (text.startsWith('#EXTM3U')) {
+                      for (final rawLine in text.split('\n')) {
+                        final line = rawLine.trim();
+                        if (line.isEmpty || line.startsWith('#')) continue;
+                        final parsed = Uri.parse(line);
+                        final q = Map<String, String>.from(parsed.queryParameters);
+                        final tsSize = int.tryParse(q['ts_size'] ?? '0') ?? 0;
+                        if (tsSize <= 0) continue;
+                        final idxMatch = RegExp(r'_(\d+)_ts/').firstMatch(parsed.path);
+                        if (idxMatch == null) continue;
+                        final idx = int.parse(idxMatch.group(1)!);
+                        q['range'] = '0-${tsSize - 1}';
+                        q['len'] = '$tsSize';
+                        final fullUrl = parsed.replace(queryParameters: q).toString();
+                        known.putIfAbsent(idx, () => {'idx': idx, 'url': fullUrl, 'size': tsSize});
+                      }
+                    }
+                  } catch (_) {
+                    await Future.delayed(const Duration(milliseconds: 800));
+                  }
+
+                  final currentMax = known.isEmpty ? -1 : known.keys.reduce(max);
+                  if (currentMax > maxKnownIdx) {
+                    maxKnownIdx = currentMax;
+                    noNewMaxStreak = 0;
+                  } else {
+                    noNewMaxStreak++;
+                  }
+
+                  if (known.isNotEmpty && isComplete()) {
+                    final confidence = max(10, maxKnownIdx);
+                    if (noNewMaxStreak >= confidence) break;
+                  }
+                  final budget = maxKnownIdx > 0 ? min(100, max(30, maxKnownIdx * 3)) : 30;
+                  if (reqCount >= budget) break;
+
+                  if (reqCount % 5 == 0 && mounted) {
+                    setState(() {
+                      _statusText = 'Scanning chunks: req $reqCount/$budget, found ${known.length}';
+                    });
+                  }
+                  await Future.delayed(const Duration(milliseconds: 350));
+                }
+
+                if (known.isEmpty) {
+                  throw Exception('Could not find any video chunks from TeraBox.');
+                }
+
+                final sortedKeys = known.keys.toList()..sort();
+                final chunks = sortedKeys.map((k) => known[k]!).toList();
+                final totalExpected = chunks.fold<int>(0, (sum, c) => sum + (c['size'] as int));
+
+                final baseName = filename.contains('.') ? filename.substring(0, filename.lastIndexOf('.')) : filename;
+                final outName = '$baseName.ts';
+                final outFile = File('${tmpDir.path}/$outName');
+                final sink = outFile.openWrite();
+
+                _log('[5/5] Downloading ${chunks.length} chunk(s)...');
+                int downloadedTotal = 0;
+                try {
+                  for (int i = 0; i < chunks.length; i++) {
+                    if (_cancelRequested) throw Exception('Cancelled');
+                    final c = chunks[i];
+                    final cUrl = c['url'] as String;
+
+                    bool ok = false;
+                    for (int attempt = 0; attempt < 5 && !ok; attempt++) {
+                      if (_cancelRequested) throw Exception('Cancelled');
+                      try {
+                        final req = await client.getUrl(Uri.parse(cUrl)).timeout(const Duration(seconds: 60));
+                        headers.forEach((k, v) => req.headers.set(k, v));
+                        final resp = await req.close().timeout(const Duration(seconds: 60));
+                        if (resp.statusCode >= 400) throw Exception('HTTP ${resp.statusCode}');
+                        await for (final bytes in resp) {
+                          if (_cancelRequested) throw Exception('Cancelled');
+                          sink.add(bytes);
+                          downloadedTotal += bytes.length;
+                          if (mounted) {
+                            setState(() {
+                              _progress = totalExpected > 0
+                                  ? (downloadedTotal / totalExpected).clamp(0.0, 1.0)
+                                  : null;
+                              _statusText =
+                                  'Chunk ${i + 1}/${chunks.length} • ${_fmtBytes(downloadedTotal)} / ${_fmtBytes(totalExpected)}';
+                            });
+                          }
+                        }
+                        ok = true;
+                      } catch (e) {
+                        if (attempt == 4 || _cancelRequested) rethrow;
+                        await Future.delayed(Duration(seconds: 1 << attempt));
+                      }
+                    }
+                  }
+                } finally {
+                  await sink.close();
+                }
+
+                _log('Saving to phone Downloads...');
+                final savedPath = await _ch.invokeMethod<String>('saveToDownloads', {
+                  'srcPath': outFile.path,
+                  'fileName': outName,
+                  'mimeType': 'video/mp2t',
+                });
+                _log('Done! Saved to $savedPath (Play in VLC / MX Player)');
+              } finally {
+                client.close(force: true);
+                if (tmpDir.existsSync()) tmpDir.deleteSync(recursive: true);
+              }
+            }
+
+            Future<void> _runProxyEngine(String rawUrl, {required bool isHd, required bool isDiskwala}) async {
+              final client = HttpClient();
+              final tmpDir = Directory.systemTemp.createTempSync('px_');
+              try {
+                String downloadUrl = '';
+                String filename = 'video.mp4';
+
+                if (isDiskwala) {
+                  final dwUrl = _dwProxyCtrl.text.trim();
+                  final dwKey = _dwKeyCtrl.text.trim();
+                  if (dwUrl.isEmpty || dwKey.isEmpty) {
+                    throw Exception('Set DISKWALA_PROXY_URL and DISKWALA_API_KEY in Settings first.');
+                  }
+                  _log('Requesting Diskwala proxy...');
+                  final req = await client.postUrl(Uri.parse(dwUrl)).timeout(const Duration(seconds: 120));
+                  req.headers.contentType = ContentType.json;
+                  req.headers.set('x-api-key', dwKey);
+                  req.write(jsonEncode({'url': rawUrl}));
+                  final resp = await req.close().timeout(const Duration(seconds: 120));
+                  final text = await resp.transform(utf8.decoder).join();
+                  if (resp.statusCode != 200) throw Exception('Proxy HTTP ${resp.statusCode}: $text');
+                  final data = jsonDecode(text) as Map<String, dynamic>;
+                  final fi = (data['fileInfo'] as Map<String, dynamic>?) ?? {};
+                  downloadUrl = (fi['url'] ?? '').toString();
+                  filename = _safeFilename((fi['name'] ?? 'diskwala_video.mp4').toString());
+                } else {
+                  final proxyUrl = _proxyUrlCtrl.text.trim();
+                  final thirdParty = _thirdPartyCtrl.text.trim();
+                  if (proxyUrl.isEmpty || thirdParty.isEmpty) {
+                    throw Exception('Set PROXY_URL and THIRD_PARTY_TERABOXDL_URL in Settings first.');
+                  }
+                  _log('Requesting TeraBox proxy...');
+                  final req = await client.postUrl(Uri.parse(proxyUrl)).timeout(const Duration(seconds: 120));
+                  req.headers.contentType = ContentType.json;
+                  req.write(jsonEncode({
+                    'cmd': 'request.post2',
+                    'base_url': thirdParty,
+                    'post_endpoint': 'api/proxy',
+                    'post_json_body': jsonEncode({'url': rawUrl}),
+                  }));
+                  final resp = await req.close().timeout(const Duration(seconds: 120));
+                  final text = await resp.transform(utf8.decoder).join();
+                  if (resp.statusCode != 200) throw Exception('Proxy HTTP ${resp.statusCode}');
+                  final outer = jsonDecode(text) as Map<String, dynamic>;
+                  final targetResp = outer['target_url_response'] as Map<String, dynamic>?;
+                  final rawBody = targetResp?['body'];
+                  final body = rawBody is String ? jsonDecode(rawBody) : rawBody as Map<String, dynamic>?;
+                  final list = (body?['list'] as List?) ?? [];
+                  if (list.isEmpty) throw Exception('Empty file list from proxy');
+                  final fi = list[0] as Map<String, dynamic>;
+                  filename = _safeFilename((fi['server_filename'] ?? 'video.mp4').toString());
+                  downloadUrl = isHd
+                      ? (fi['direct_link'] ?? '').toString()
+                      : (fi['stream_url'] ?? fi['direct_link'] ?? '').toString();
+                }
+
+                if (downloadUrl.isEmpty) throw Exception('No download URL returned by proxy.');
+                final outName = filename.toLowerCase().endsWith('.mp4') ? filename : '$filename.mp4';
+                final outFile = File('${tmpDir.path}/$outName');
+
+                if (downloadUrl.toLowerCase().contains('m3u8')) {
+                  _log('Downloading HLS segments from proxy...');
+                  final manifest = await _httpGetText(client, downloadUrl, headers: {'User-Agent': _randUa()});
+                  final segs = manifest
+                      .split('\n')
+                      .map((e) => e.trim())
+                      .where((e) => e.isNotEmpty && !e.startsWith('#'))
+                      .map((e) => e.startsWith('http') ? e : Uri.parse(downloadUrl).resolve(e).toString())
+                      .toList();
+                  if (segs.isEmpty) throw Exception('No segments in m3u8 manifest.');
+                  final tsName = '${outName.substring(0, outName.length - 4)}.ts';
+                  final tsFile = File('${tmpDir.path}/$tsName');
+                  final sink = tsFile.openWrite();
+                  try {
+                    for (int i = 0; i < segs.length; i++) {
+                      if (_cancelRequested) throw Exception('Cancelled');
+                      final req = await client.getUrl(Uri.parse(segs[i])).timeout(const Duration(seconds: 45));
+                      final resp = await req.close();
+                      await for (final b in resp) {
+                        sink.add(b);
+                      }
+                      if (mounted) {
+                        setState(() {
+                          _progress = (i + 1) / segs.length;
+                          _statusText = 'HLS segment ${i + 1}/${segs.length}';
+                        });
+                      }
+                    }
+                  } finally {
+                    await sink.close();
+                  }
+                  final saved = await _ch.invokeMethod<String>('saveToDownloads', {
+                    'srcPath': tsFile.path,
+                    'fileName': tsName,
+                    'mimeType': 'video/mp2t',
+                  });
+                  _log('Done! Saved to $saved');
+                } else {
+                  _log('Downloading $outName...');
+                  await _downloadDirectStreamToFile(client, downloadUrl, outFile, headers: {
+                    'User-Agent': _randUa(),
+                  });
+                  final saved = await _ch.invokeMethod<String>('saveToDownloads', {
+                    'srcPath': outFile.path,
+                    'fileName': outName,
+                    'mimeType': 'video/mp4',
+                  });
+                  _log('Done! Saved to $saved');
+                }
+              } finally {
+                client.close(force: true);
+                if (tmpDir.existsSync()) tmpDir.deleteSync(recursive: true);
+              }
+            }
+
+            Future<void> _startDownload() async {
+              final raw = _urlCtrl.text.trim();
+              if (raw.isEmpty) {
+                _log('Please paste a link first.');
+                return;
+              }
+              final url = (raw.startsWith('http://') || raw.startsWith('https://')) ? raw : 'https://$raw';
+
+              setState(() {
+                _busy = true;
+                _cancelRequested = false;
+                _progress = null;
+                _logs.clear();
+              });
+
+              try {
+                if (_mode == 'get') {
+                  await _runTraditionalEngine(url);
+                } else if (_mode == 'exp') {
+                  await _runProxyEngine(url, isHd: false, isDiskwala: false);
+                } else if (_mode == 'exphd') {
+                  await _runProxyEngine(url, isHd: true, isDiskwala: false);
+                } else {
+                  await _runProxyEngine(url, isHd: true, isDiskwala: true);
+                }
+              } catch (e) {
+                _log('Error: $e');
+              } finally {
+                if (mounted) {
+                  setState(() {
+                    _busy = false;
+                    _progress = null;
+                  });
+                }
+              }
+            }
+
+            Future<void> _openBrowser(String url) async {
+              final target = url.trim().isEmpty
+                  ? 'https://www.1024tera.com'
+                  : (url.startsWith('http') ? url : 'https://$url');
+              await _ch.invokeMethod('openBrowser', {'url': target});
+            }
+
+            Widget _buildDownloadTab() {
+              final hasCookies = _cookiesCtrl.text.trim().isNotEmpty;
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  TextField(
+                    controller: _urlCtrl,
+                    enabled: !_busy,
+                    decoration: const InputDecoration(
+                      labelText: 'TeraBox / Diskwala Link',
+                      hintText: 'https://1024terabox.com/s/1...',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.link),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _busy
+                              ? null
+                              : () async {
+                                  final d = await Clipboard.getData('text/plain');
+                                  if (d?.text != null) {
+                                    setState(() => _urlCtrl.text = d!.text!.trim());
+                                  }
+                                },
+                          icon: const Icon(Icons.paste),
+                          label: const Text('Paste'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _busy ? null : () => setState(() => _urlCtrl.clear()),
+                          icon: const Icon(Icons.clear),
+                          label: const Text('Clear'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  const Text('Select Mode (from Repo):', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      ChoiceChip(
+                        label: const Text('/get (Direct)'),
+                        selected: _mode == 'get',
+                        onSelected: _busy ? null : (_) => setState(() => _mode = 'get'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('/exp (Proxy)'),
+                        selected: _mode == 'exp',
+                        onSelected: _busy ? null : (_) => setState(() => _mode = 'exp'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('/exphd (Proxy HD)'),
+                        selected: _mode == 'exphd',
+                        onSelected: _busy ? null : (_) => setState(() => _mode = 'exphd'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('/dw (Diskwala)'),
+                        selected: _mode == 'dw',
+                        onSelected: _busy ? null : (_) => setState(() => _mode = 'dw'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  if (!_busy)
+                    FilledButton.icon(
+                      onPressed: _startDownload,
+                      icon: const Icon(Icons.download),
+                      label: const Text('Download Video'),
+                    )
+                  else
+                    FilledButton.tonalIcon(
+                      onPressed: () => setState(() => _cancelRequested = true),
+                      icon: const Icon(Icons.cancel),
+                      label: const Text('Cancel Download'),
+                    ),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () => _openBrowser(_urlCtrl.text),
+                    icon: const Icon(Icons.open_in_browser),
+                    label: Text(hasCookies
+                        ? 'Open in Built-in Browser (Cookies Ready)'
+                        : 'Open Browser (Login & Grab Cookies)'),
+                  ),
+                  const SizedBox(height: 16),
+                  if (_busy) ...[
+                    LinearProgressIndicator(value: _progress),
+                    const SizedBox(height: 8),
+                  ],
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(_statusText, style: const TextStyle(fontWeight: FontWeight.bold)),
+                          if (_logs.isNotEmpty) ...[
+                            const Divider(),
+                            ..._logs.reversed.take(8).map((l) => Text('• $l', style: const TextStyle(fontSize: 12))),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            }
+
+            Widget _buildSettingsTab() {
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  FilledButton.tonalIcon(
+                    onPressed: () => _openBrowser('https://www.1024tera.com'),
+                    icon: const Icon(Icons.cookie),
+                    label: const Text('Login TeraBox & Auto-Grab Cookies'),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _cookiesCtrl,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                      labelText: 'COOKIES1 (Required for /get Direct Mode)',
+                      hintText: 'browserid=...; ndut_fmt=...; csrfToken=...',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('Optional Proxy Settings (for /exp, /exphd, /dw):',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _proxyUrlCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'PROXY_URL',
+                      hintText: 'http://your-proxy/v1',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _thirdPartyCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'THIRD_PARTY_TERABOXDL_URL',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _dwProxyCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'DISKWALA_PROXY_URL',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _dwKeyCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'DISKWALA_API_KEY',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    onPressed: _savePrefs,
+                    icon: const Icon(Icons.save),
+                    label: const Text('Save Settings'),
+                  ),
+                ],
+              );
+            }
+
+            Widget _buildGuideTab() {
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: const [
+                  Card(
+                    child: Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text(
+                        'Beginner Guide (App Kaise Use Karein):\n\n'
+                        '1. Sabse pehle Settings tab me jayein aur "Login TeraBox & Auto-Grab Cookies" par tap karein.\n'
+                        '2. TeraBox account se login karein (Free account bhi chalega), phir upar "Save Cookies" button dabakar "Close" karein.\n'
+                        '3. Ab Download tab me koi bhi TeraBox link paste karein, "/get (Direct)" select karein aur "Download Video" dabayein.\n'
+                        '4. File aapke phone ke "Downloads/TeraBoxDL" folder me save hogi.\n'
+                        '5. Note: /get mode se download hui .ts video ko dekhne ke liye VLC ya MX Player use karein.\n'
+                        '6. Agar kabhi /get fail ho, to "Open in Built-in Browser" dabakar "Desktop" mode ON karein aur page se direct download karein.',
+                        style: TextStyle(height: 1.5),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('TeraBox Video Downloader'),
+                  centerTitle: true,
+                ),
+                body: IndexedStack(
+                  index: _tab,
+                  children: [
+                    _buildDownloadTab(),
+                    _buildSettingsTab(),
+                    _buildGuideTab(),
+                  ],
+                ),
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: _tab,
+                  onDestinationSelected: (i) => setState(() => _tab = i),
+                  destinations: const [
+                    NavigationDestination(icon: Icon(Icons.download), label: 'Download'),
+                    NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
+                    NavigationDestination(icon: Icon(Icons.help_outline), label: 'Guide'),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build Release APK
+        working-directory: terabox_dl
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: terabox_dl/build/app/outputs/flutter-apk/app-release.apk
